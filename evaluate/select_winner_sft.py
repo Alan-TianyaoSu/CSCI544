@@ -266,26 +266,39 @@ def evaluate_model(
     labels: List[int] = []
     margins: List[float] = []
     truncation_notifier = [False]
+    skipped_samples = 0
 
-    for prompt, resp_a, resp_b, label in tqdm(samples, desc=desc, ncols=100):
+    for sample_idx, (prompt, resp_a, resp_b, label) in enumerate(
+        tqdm(samples, desc=desc, ncols=100),
+        start=1,
+    ):
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
 
-        score_a = compute_response_score(
-            model,
-            tokenizer,
-            prompt_ids,
-            resp_a,
-            device,
-            truncation_notifier,
-        )
-        score_b = compute_response_score(
-            model,
-            tokenizer,
-            prompt_ids,
-            resp_b,
-            device,
-            truncation_notifier,
-        )
+        try:
+            score_a = compute_response_score(
+                model,
+                tokenizer,
+                prompt_ids,
+                resp_a,
+                device,
+                truncation_notifier,
+            )
+            score_b = compute_response_score(
+                model,
+                tokenizer,
+                prompt_ids,
+                resp_b,
+                device,
+                truncation_notifier,
+            )
+        except torch.cuda.OutOfMemoryError:
+            skipped_samples += 1
+            torch.cuda.empty_cache()
+            print(
+                f"\n[Warning] CUDA OOM when scoring sample #{sample_idx}. "
+                "Skipping this sample."
+            )
+            continue
 
         pred = 1 if score_a > score_b else 0
         preds.append(pred)
@@ -294,10 +307,13 @@ def evaluate_model(
 
     metrics = {
         "num_samples": len(labels),
-        "accuracy": accuracy_score(labels, preds),
-        "recall": recall_score(labels, preds, pos_label=1, zero_division=0),
-        "f1": f1_score(labels, preds, pos_label=1, zero_division=0),
+        "accuracy": accuracy_score(labels, preds) if labels else 0.0,
+        "recall": recall_score(labels, preds, pos_label=1, zero_division=0)
+        if labels
+        else 0.0,
+        "f1": f1_score(labels, preds, pos_label=1, zero_division=0) if labels else 0.0,
         "avg_margin": float(np.mean(margins)) if margins else 0.0,
+        "skipped_samples": skipped_samples,
     }
     return metrics
 

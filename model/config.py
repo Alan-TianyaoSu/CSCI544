@@ -134,6 +134,54 @@ class ModelConfigRegistry:
             ) from exc
 
 
+@dataclass(frozen=True)
+class DPOTrainingConfig:
+    """
+    Container for DPO-specific runtime overrides.
+    """
+    train_file: Path
+    eval_file: Optional[Path] = None
+    output_dir: Path = Path("checkpoints/dpo")
+    adapter_name: str = "adalora-dpo"
+    learning_rate: Optional[float] = 5e-5
+    num_train_epochs: Optional[float] = None
+    per_device_train_batch_size: Optional[int] = None
+    per_device_eval_batch_size: Optional[int] = None
+    gradient_accumulation_steps: Optional[int] = None
+    max_seq_length: int = 1024
+    max_prompt_length: int = 512
+    beta: float = 0.1
+    loss_type: str = "sigmoid"
+    label_smoothing: float = 0.0
+    precompute_ref_log_probs: bool = False
+    resume_checkpoint: Optional[Path] = None
+    save_total_limit: Optional[int] = None
+    logging_steps: Optional[int] = None
+    eval_strategy: Optional[str] = None
+    eval_steps: Optional[int] = None
+    save_strategy: Optional[str] = None
+    save_steps: Optional[int] = None
+    warmup_ratio: Optional[float] = None
+    warmup_steps: Optional[int] = None
+    weight_decay: Optional[float] = None
+    bf16: Optional[bool] = None
+    tf32: Optional[bool] = None
+    gradient_checkpointing: Optional[bool] = None
+    report_to: Optional[Union[str, Sequence[str]]] = None
+    steps_per_epoch: Optional[int] = None
+    max_steps: Optional[int] = None
+    world_size: Optional[int] = None
+    save_only_model: Optional[bool] = None
+    logging_strategy: Optional[str] = None
+    load_best_model_at_end: Optional[bool] = None
+    metric_for_best_model: Optional[str] = None
+    greater_is_better: Optional[bool] = None
+    dataset_num_proc: Optional[int] = None
+    dataloader_num_workers: Optional[int] = None
+    dataloader_pin_memory: Optional[bool] = None
+    dataloader_drop_last: Optional[bool] = None
+
+
 # *********************************************************************************
 # Add model here, use model_download.py will download all the model in base_models/
 # *********************************************************************************

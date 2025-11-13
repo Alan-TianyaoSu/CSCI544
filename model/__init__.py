@@ -5,6 +5,7 @@ from .config import (
     ModelConfigRegistry,
     ModelRuntimeConfig,
     SFTTrainingConfig,
+    DPOTrainingConfig,
 )
 from .lora import (
     build_adalora_model,
@@ -20,4 +21,5 @@ __all__ = [
     "build_adalora_model",
     "ensure_adapter_directory",
     "load_peft_adapter_if_available",
+    "DPOTrainingConfig",
 ]

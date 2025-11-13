@@ -1,14 +1,10 @@
-# supervised_fine_tuning/train.py
+# supervised_fine_tuning\train.py
 
 from __future__ import annotations
 
-import csv
-import dataclasses
-import json
 import math
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 from transformers import (
@@ -27,139 +23,6 @@ from model.lora import (
 )
 from .data_module import SFTDataModule
 from .evaluate import evaluate_perplexity
-
-try:
-    import matplotlib.pyplot as plt
-
-    MATPLOTLIB_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    MATPLOTLIB_AVAILABLE = False
-
-
-TRAINING_RESULTS_ROOT = Path("results") / "training" / "SFT"
-
-
-def _ensure_directory(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def _sanitize_for_path(component: str) -> str:
-    return component.replace("/", "__").replace("\\", "__").replace(":", "_").strip() or "default"
-
-
-def _serialize_value(value: Any) -> Any:
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if hasattr(value, "item"):
-        try:
-            return value.item()
-        except (ValueError, TypeError):
-            return str(value)
-    return str(value)
-
-
-def _sanitize_record(record: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: _serialize_value(value) for key, value in record.items()}
-
-
-def _write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
-
-
-def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
-    if not rows:
-        return
-    fieldnames = sorted({key for row in rows for key in row.keys()})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({field: _serialize_value(row.get(field)) for field in fieldnames})
-
-
-def _serialize_config(config_obj: Any) -> Any:
-    if config_obj is None:
-        return None
-    if isinstance(config_obj, (str, int, float, bool)):
-        return config_obj
-    if isinstance(config_obj, Path):
-        return str(config_obj)
-    if isinstance(config_obj, dict):
-        return {key: _serialize_config(value) for key, value in config_obj.items()}
-    if isinstance(config_obj, (list, tuple, set)):
-        return [_serialize_config(item) for item in config_obj]
-    if hasattr(config_obj, "model_dump"):
-        try:
-            return config_obj.model_dump()
-        except TypeError:
-            pass
-    if hasattr(config_obj, "dict"):
-        try:
-            return config_obj.dict()
-        except TypeError:
-            pass
-    if dataclasses.is_dataclass(config_obj):
-        return dataclasses.asdict(config_obj)
-    if hasattr(config_obj, "__dict__"):
-        return {
-            key: _serialize_config(value)
-            for key, value in config_obj.__dict__.items()
-            if not key.startswith("_")
-        }
-    return str(config_obj)
-
-
-def _create_result_dir(model_label: str, adapter_label: str) -> Tuple[Path, str]:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_component = _sanitize_for_path(model_label)
-    adapter_component = _sanitize_for_path(adapter_label)
-    result_dir = TRAINING_RESULTS_ROOT / model_component / adapter_component / timestamp
-    _ensure_directory(result_dir)
-    return result_dir, timestamp
-
-
-def _plot_loss_curves(log_history: List[Dict[str, Any]], output_path: Path) -> None:
-    if not MATPLOTLIB_AVAILABLE or not log_history:
-        return
-
-    train_steps: List[float] = []
-    train_losses: List[float] = []
-    eval_steps: List[float] = []
-    eval_losses: List[float] = []
-
-    for record in log_history:
-        step = record.get("step") or record.get("global_step")
-        if step is None:
-            continue
-        if "loss" in record and record["loss"] is not None:
-            train_steps.append(float(step))
-            train_losses.append(float(record["loss"]))
-        if "eval_loss" in record and record["eval_loss"] is not None:
-            eval_steps.append(float(step))
-            eval_losses.append(float(record["eval_loss"]))
-
-    if not train_losses and not eval_losses:
-        return
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    if train_losses:
-        ax.plot(train_steps, train_losses, label="Train loss", color="#1f77b4")
-    if eval_losses:
-        ax.plot(eval_steps, eval_losses, label="Eval loss", color="#ff7f0e")
-    ax.set_xlabel("Step")
-    ax.set_ylabel("Loss")
-    ax.set_title("SFT training loss curve")
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
 
 
 def _determine_world_size(configured_world_size: Optional[int]) -> int:
@@ -261,37 +124,6 @@ def run_sft_training(
         )
 
     print(f"[Model training]: ✅ Resolved optimizer steps: {total_steps}")
-
-    model_label = getattr(model_config, "name", None) or model_source
-    adapter_label = training_config.adapter_name or "adapter"
-    result_dir, timestamp = _create_result_dir(model_label, adapter_label)
-
-    run_metadata = {
-        "timestamp": timestamp,
-        "model_label": model_label,
-        "model_source": model_source,
-        "adapter_name": training_config.adapter_name,
-        "train_file": str(training_config.train_file) if training_config.train_file else None,
-        "eval_file": str(training_config.eval_file) if training_config.eval_file else None,
-        "train_samples": train_sample_count,
-        "total_steps": total_steps,
-        "world_size": training_plan["world_size"],
-        "gradient_accumulation_steps": training_plan["gradient_accumulation_steps"],
-        "matplotlib_available": MATPLOTLIB_AVAILABLE,
-        "resume_from_checkpoint": str(training_config.resume_checkpoint)
-        if training_config.resume_checkpoint is not None
-        else None,
-        "result_dir": str(result_dir),
-    }
-    _write_json(
-        result_dir / "configurations.json",
-        {
-            "model_config": _serialize_config(model_config),
-            "training_config": _serialize_config(training_config),
-            "training_plan": training_plan,
-        },
-    )
-    _write_json(result_dir / "run_metadata.json", run_metadata)
 
     base_model = _load_base_model(model_source, model_config)
     if hasattr(base_model, "resize_token_embeddings"):
@@ -401,18 +233,7 @@ def run_sft_training(
         else None
     )
 
-    train_output = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-    train_metrics = train_output.metrics if train_output is not None else {}
-    _write_json(result_dir / "train_metrics.json", train_metrics)
-
-    log_history_raw = trainer.state.log_history or []
-    log_history = [_sanitize_record(entry) for entry in log_history_raw]
-    if log_history:
-        _write_json(result_dir / "log_history.json", log_history)
-        _write_csv(result_dir / "log_history.csv", log_history)
-        _plot_loss_curves(log_history, result_dir / "plots" / "loss_curve.png")
-    else:
-        print("[Model training]: ⚠️ No log history captured; skipping CSV/plot export.")
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     adapter_save_root = adapter_root
     adapter_save_dir = adapter_subdir
@@ -424,25 +245,6 @@ def run_sft_training(
     metrics: Dict[str, float] = {}
     if dataset.get("validation") is not None:
         metrics = evaluate_perplexity(trainer)
-    _write_json(result_dir / "evaluation_metrics.json", metrics)
-
-    summary_payload = {
-        "timestamp": timestamp,
-        "result_dir": str(result_dir),
-        "train_metrics": train_metrics,
-        "evaluation_metrics": metrics,
-        "best_model_checkpoint": (
-            str(trainer.state.best_model_checkpoint)
-            if trainer.state.best_model_checkpoint is not None
-            else None
-        ),
-        "matplotlib_available": MATPLOTLIB_AVAILABLE,
-    }
-    _write_json(result_dir / "summary.json", summary_payload)
 
     trainer.save_state()
-    print(f"[Model training]: 📁 Artifact directory: {result_dir}")
-    if not MATPLOTLIB_AVAILABLE:
-        print("[Model training]: ⚠️ matplotlib is not installed; loss curve plot was skipped.")
-
     return metrics

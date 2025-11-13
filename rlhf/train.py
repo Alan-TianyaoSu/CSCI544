@@ -1,5 +1,4 @@
-# supervised_fine_tuning/train.py
-
+# rlhf/train.py
 from __future__ import annotations
 
 import csv
@@ -14,19 +13,19 @@ import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
-    Trainer,
-    TrainingArguments,
 )
 
-from model.config import ModelRuntimeConfig, SFTTrainingConfig
+from trl import DPOTrainer, DPOConfig
+
+from model.config import ModelRuntimeConfig, DPOTrainingConfig
 from model.lora import (
     build_adalora_model,
     ensure_adapter_directory,
     load_peft_adapter_if_available,
 )
-from .data_module import SFTDataModule
-from .evaluate import evaluate_perplexity
+
+from .data_module import DPODataModule
+from .evaluate import evaluate_dpo
 
 try:
     import matplotlib.pyplot as plt
@@ -36,7 +35,7 @@ except ImportError:  # pragma: no cover
     MATPLOTLIB_AVAILABLE = False
 
 
-TRAINING_RESULTS_ROOT = Path("results") / "training" / "SFT"
+TRAINING_RESULTS_ROOT = Path("results") / "training" / "DPO"
 
 
 def _ensure_directory(path: Path) -> None:
@@ -154,7 +153,7 @@ def _plot_loss_curves(log_history: List[Dict[str, Any]], output_path: Path) -> N
         ax.plot(eval_steps, eval_losses, label="Eval loss", color="#ff7f0e")
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss")
-    ax.set_title("SFT training loss curve")
+    ax.set_title("DPO training loss curve")
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
     ax.legend()
     fig.tight_layout()
@@ -180,15 +179,16 @@ def _load_base_model(model_source: str, model_config: ModelRuntimeConfig) -> tor
     model_kwargs = model_config.build_model_kwargs()
     dtype_name = model_config.dtype or "float32"
     dtype = getattr(torch, dtype_name)
-    return AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         model_source,
         dtype=dtype,
         **model_kwargs,
     )
+    return model
 
 
 def _resolve_training_plan(
-    training_config: SFTTrainingConfig,
+    training_config: DPOTrainingConfig,
     train_dataset_size: int,
 ) -> Dict[str, Optional[float]]:
     num_epochs = training_config.num_train_epochs
@@ -231,23 +231,24 @@ def _resolve_training_plan(
     }
 
 
-def run_sft_training(
+def run_dpo_training(
     model_config: ModelRuntimeConfig,
-    training_config: SFTTrainingConfig,
+    training_config: DPOTrainingConfig,
 ) -> Dict[str, float]:
     model_source = model_config.resolve_model_source()
     tokenizer = _load_tokenizer(model_source, model_config)
 
-    data_module = SFTDataModule(
+    data_module = DPODataModule(
         tokenizer=tokenizer,
         max_length=training_config.max_seq_length,
+        max_prompt_length=training_config.max_prompt_length,
     )
     dataset = data_module.load_dataset_dict(
         train_path=training_config.train_file,
         eval_path=training_config.eval_file,
     )
     train_sample_count = len(dataset["train"])
-    print(f"[Model training]: ✅ Loaded dataset (train samples: {train_sample_count})")
+    print(f"[DPO training]: ✅ Loaded dataset (train samples: {train_sample_count})")
 
     training_plan = _resolve_training_plan(
         training_config=training_config,
@@ -260,7 +261,7 @@ def run_sft_training(
             "steps_per_epoch and num_train_epochs through manual configuration."
         )
 
-    print(f"[Model training]: ✅ Resolved optimizer steps: {total_steps}")
+    print(f"[DPO training]: ✅ Resolved optimizer steps: {total_steps}")
 
     model_label = getattr(model_config, "name", None) or model_source
     adapter_label = training_config.adapter_name or "adapter"
@@ -315,14 +316,14 @@ def run_sft_training(
         if model_config.adalora is None:
             raise ValueError(
                 f"No AdaLoRA configuration supplied for model '{model_config.name}'. "
-                "Please define it in manual_train.py."
+                "Please define it in the DPO manual configuration."
             )
         model = build_adalora_model(
             base_model=base_model,
             adapter_dir=adapter_root,
             adapter_name=training_config.adapter_name,
-            adalora_config=model_config.adalora,
             total_step=int(total_steps),
+            adalora_config=model_config.adalora,
         )
 
     if training_config.gradient_checkpointing and hasattr(model, "config"):
@@ -338,14 +339,16 @@ def run_sft_training(
     if hasattr(model, "resize_token_embeddings"):
         model.resize_token_embeddings(len(tokenizer))
 
-    print(f"[Model training]: ✅ Success loading model and LoRA: {model_config.name}")
+    ref_model = _load_base_model(model_source, model_config)
+    if hasattr(ref_model, "resize_token_embeddings"):
+        ref_model.resize_token_embeddings(len(tokenizer))
+    ref_model.eval()
+    for param in ref_model.parameters():
+        param.requires_grad_(False)
 
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+    print(f"[DPO training]: ✅ Loaded policy and reference models for {model_config.name}")
 
-    training_args_kwargs: Dict[str, object] = {
+    dpo_args_kwargs: Dict[str, object] = {
         "output_dir": str(training_config.output_dir),
         "num_train_epochs": training_plan["num_train_epochs"],
         "per_device_train_batch_size": training_plan["per_device_train_batch_size"],
@@ -355,44 +358,56 @@ def run_sft_training(
         "weight_decay": training_config.weight_decay,
         "logging_steps": training_config.logging_steps,
         "eval_strategy": training_config.eval_strategy,
+        "eval_steps": training_config.eval_steps,
         "save_strategy": training_config.save_strategy,
+        "save_steps": training_config.save_steps,
         "save_total_limit": training_config.save_total_limit,
+        "save_only_model": training_config.save_only_model,
+        "warmup_ratio": training_config.warmup_ratio,
+        "warmup_steps": training_config.warmup_steps,
         "bf16": training_config.bf16,
         "tf32": training_config.tf32,
         "gradient_checkpointing": training_config.gradient_checkpointing,
         "report_to": training_config.report_to if training_config.report_to is not None else "none",
-        "warmup_ratio": training_config.warmup_ratio,
-        "warmup_steps": training_config.warmup_steps,
-        "eval_steps": training_config.eval_steps,
-        "save_steps": training_config.save_steps,
         "logging_strategy": training_config.logging_strategy,
-        "save_only_model": training_config.save_only_model,
         "load_best_model_at_end": training_config.load_best_model_at_end,
         "metric_for_best_model": training_config.metric_for_best_model,
         "greater_is_better": training_config.greater_is_better,
+        "dataloader_num_workers": training_config.dataloader_num_workers,
+        "dataloader_pin_memory": training_config.dataloader_pin_memory,
+        "dataloader_drop_last": training_config.dataloader_drop_last,
+        "remove_unused_columns": False,
+        # DPO-specific parameters
+        "beta": training_config.beta,
+        "loss_type": training_config.loss_type,
+        "label_smoothing": training_config.label_smoothing,
+        "max_length": training_config.max_seq_length,
+        "max_prompt_length": training_config.max_prompt_length,
+        "precompute_ref_log_probs": training_config.precompute_ref_log_probs,
+        "dataset_num_proc": training_config.dataset_num_proc,
     }
 
     if training_config.gradient_checkpointing:
-        training_args_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+        dpo_args_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
 
     max_steps = training_plan["max_steps"]
-    training_args_kwargs["max_steps"] = max_steps if max_steps is not None else -1
+    dpo_args_kwargs["max_steps"] = max_steps if max_steps is not None else -1
 
-    training_args_kwargs = {
+    dpo_args_kwargs = {
         key: value
-        for key, value in training_args_kwargs.items()
+        for key, value in dpo_args_kwargs.items()
         if value is not None
     }
 
-    training_args = TrainingArguments(**training_args_kwargs)
+    dpo_args = DPOConfig(**dpo_args_kwargs)
 
-    trainer = Trainer(
+    dpo_trainer = DPOTrainer(
         model=model,
-        args=training_args,
+        ref_model=ref_model,
+        args=dpo_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("validation"),
         processing_class=tokenizer,
-        data_collator=data_collator,
     )
 
     resume_from_checkpoint = (
@@ -401,29 +416,26 @@ def run_sft_training(
         else None
     )
 
-    train_output = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    train_output = dpo_trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     train_metrics = train_output.metrics if train_output is not None else {}
     _write_json(result_dir / "train_metrics.json", train_metrics)
 
-    log_history_raw = trainer.state.log_history or []
+    log_history_raw = dpo_trainer.state.log_history or []
     log_history = [_sanitize_record(entry) for entry in log_history_raw]
     if log_history:
         _write_json(result_dir / "log_history.json", log_history)
         _write_csv(result_dir / "log_history.csv", log_history)
         _plot_loss_curves(log_history, result_dir / "plots" / "loss_curve.png")
     else:
-        print("[Model training]: ⚠️ No log history captured; skipping CSV/plot export.")
+        print("[DPO training]: ⚠️ No log history captured; skipping CSV/plot export.")
 
-    adapter_save_root = adapter_root
-    adapter_save_dir = adapter_subdir
-    ensure_adapter_directory(adapter_save_root)
-    trainer.model.save_pretrained(adapter_save_root, save_embedding_layers=True)
-    ensure_adapter_directory(adapter_save_dir)
-    tokenizer.save_pretrained(adapter_save_dir)
+    ensure_adapter_directory(adapter_subdir)
+    dpo_trainer.model.save_pretrained(adapter_subdir, save_embedding_layers=True)
+    tokenizer.save_pretrained(adapter_subdir)
 
     metrics: Dict[str, float] = {}
     if dataset.get("validation") is not None:
-        metrics = evaluate_perplexity(trainer)
+        metrics = evaluate_dpo(dpo_trainer)
     _write_json(result_dir / "evaluation_metrics.json", metrics)
 
     summary_payload = {
@@ -432,17 +444,17 @@ def run_sft_training(
         "train_metrics": train_metrics,
         "evaluation_metrics": metrics,
         "best_model_checkpoint": (
-            str(trainer.state.best_model_checkpoint)
-            if trainer.state.best_model_checkpoint is not None
+            str(dpo_trainer.state.best_model_checkpoint)
+            if dpo_trainer.state.best_model_checkpoint is not None
             else None
         ),
         "matplotlib_available": MATPLOTLIB_AVAILABLE,
     }
     _write_json(result_dir / "summary.json", summary_payload)
 
-    trainer.save_state()
-    print(f"[Model training]: 📁 Artifact directory: {result_dir}")
+    dpo_trainer.save_state()
+    print(f"[DPO training]: 📁 Artifact directory: {result_dir}")
     if not MATPLOTLIB_AVAILABLE:
-        print("[Model training]: ⚠️ matplotlib is not installed; loss curve plot was skipped.")
+        print("[DPO training]: ⚠️ matplotlib is not installed; loss curve plot was skipped.")
 
     return metrics

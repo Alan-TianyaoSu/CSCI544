@@ -1,12 +1,11 @@
-# manually_training.py
-
+# training/dpo_training.py
 """
-Manual configuration entry-point.
+Manual configuration entry-point for DPO fine-tuning.
 
 Examples:
-- python ./training/sft_training.py                                  # print current config
-- python ./training/sft_training.py --run                            # run SFT with the default config
-- python ./training/sft_training.py --model gemma-3-1b-it --run      # run SFT with the selected model
+- python ./training/dpo_training.py                                  # print current config
+- python ./training/dpo_training.py --run                            # run DPO with the default config
+- python ./training/dpo_training.py --model gemma-3-1b-it --run      # run DPO with the selected model
 """
 
 from __future__ import annotations
@@ -14,8 +13,9 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from transformers.trainer_utils import get_last_checkpoint
 from typing import Tuple
+
+from transformers.trainer_utils import get_last_checkpoint
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in map(str, sys.path):
@@ -25,12 +25,12 @@ from model import (
     AdaLoraRuntimeConfig,
     ModelConfigRegistry,
     ModelRuntimeConfig,
-    SFTTrainingConfig,
+    DPOTrainingConfig
 )
-from supervised_fine_tuning import run_sft_training
+from rlhf import run_dpo_training
 
 
-def _build_manual_configuration(model_name: str) -> Tuple[ModelRuntimeConfig, SFTTrainingConfig]:
+def _build_manual_configuration(model_name: str) -> Tuple[ModelRuntimeConfig, DPOTrainingConfig]:
     hf_model_id = model_name if "/" in model_name else f"google/{model_name}"
 
     model_config = ModelRuntimeConfig(
@@ -56,23 +56,27 @@ def _build_manual_configuration(model_name: str) -> Tuple[ModelRuntimeConfig, SF
     )
     ModelConfigRegistry.register(model_config)
 
-    output_dir = Path("checkpoints") / "sft" / model_name
+    output_dir = Path("checkpoints") / "dpo" / model_name
     if output_dir.exists():
         last_checkpoint = get_last_checkpoint(str(output_dir))
     else:
         last_checkpoint = None
 
-    training_config = SFTTrainingConfig(
-        train_file=Path("dataset/SFT/train.npz"),
-        eval_file=Path("dataset/SFT/validation.npz"),
+    training_config = DPOTrainingConfig(
+        train_file=Path("dataset/RLHF/train.npz"),
+        eval_file=Path("dataset/RLHF/validation.npz"),
         output_dir=output_dir,
-        adapter_name="adalora-sft",
-        learning_rate=2e-4,
+        adapter_name="adalora-dpo",
+        learning_rate=5e-5,
         num_train_epochs=1,
         per_device_train_batch_size=4,
         per_device_eval_batch_size=4,
         gradient_accumulation_steps=1,
         max_seq_length=1024,
+        max_prompt_length=512,
+        beta=0.1,
+        loss_type="sigmoid",
+        label_smoothing=0.0,
         save_total_limit=3,
         logging_steps=10,
         eval_strategy="epoch",
@@ -90,16 +94,16 @@ def _build_manual_configuration(model_name: str) -> Tuple[ModelRuntimeConfig, SF
     return model_config, training_config
 
 
-def run_manual_training(model_config: ModelRuntimeConfig, training_config: SFTTrainingConfig) -> None:
-    metrics = run_sft_training(model_config, training_config)
+def run_manual_training(model_config: ModelRuntimeConfig, training_config: DPOTrainingConfig) -> None:
+    metrics = run_dpo_training(model_config, training_config)
     if metrics:
-        print("[Manual SFT Evaluation Metrics]")
+        print("[Manual DPO Evaluation Metrics]")
         for key, value in metrics.items():
             print(f"{key}: {value:.4f}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Preview or execute the manual SFT configuration.")
+    parser = argparse.ArgumentParser(description="Preview or execute the manual DPO configuration.")
     parser.add_argument(
         "--model",
         type=str,
@@ -109,7 +113,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run",
         action="store_true",
-        help="Execute SFT using the preset configuration.",
+        help="Execute DPO using the preset configuration.",
     )
 
     args = parser.parse_args()
@@ -117,7 +121,6 @@ if __name__ == "__main__":
     model_cfg, training_cfg = _build_manual_configuration(args.model)
     print('==' * 60)
     print(f"[Manual Config] Model: {model_cfg}\n")
-
     print(f"[Manual Config] Training: {training_cfg}")
     print('==' * 60 + '\n')
 

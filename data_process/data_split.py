@@ -31,9 +31,9 @@ OUTPUT_DIRS = {
 SAMPLE_COUNTS = None
 # Technical verification sample sizes
 SAMPLE_COUNTS = {
-    "train": 50,
-    "validation": 20,
-    "test": 20,
+    "train": 600,
+    "validation": 240,
+    "test": 240,
 }
 
 WINNER_ALIASES = {
