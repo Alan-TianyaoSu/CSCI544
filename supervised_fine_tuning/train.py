@@ -95,16 +95,21 @@ def _serialize_config(config_obj: Any) -> Any:
         return [_serialize_config(item) for item in config_obj]
     if hasattr(config_obj, "model_dump"):
         try:
-            return config_obj.model_dump()
+            dumped = config_obj.model_dump()
+            return _serialize_config(dumped)
         except TypeError:
             pass
     if hasattr(config_obj, "dict"):
         try:
-            return config_obj.dict()
+            dumped = config_obj.dict()
+            return _serialize_config(dumped)
         except TypeError:
             pass
     if dataclasses.is_dataclass(config_obj):
-        return dataclasses.asdict(config_obj)
+        return {
+            key: _serialize_config(value)
+            for key, value in dataclasses.asdict(config_obj).items()
+        }
     if hasattr(config_obj, "__dict__"):
         return {
             key: _serialize_config(value)
